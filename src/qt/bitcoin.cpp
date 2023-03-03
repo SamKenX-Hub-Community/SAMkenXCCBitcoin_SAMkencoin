@@ -167,6 +167,7 @@ static void initTranslations(QTranslator &qtTranslatorBase, QTranslator &qtTrans
 
 static bool InitSettings()
 {
+    gArgs.EnsureDataDir();
     if (!gArgs.GetSettingsPath()) {
         return true; // Do nothing if settings file disabled.
     }
@@ -587,7 +588,7 @@ int GuiMain(int argc, char* argv[])
     if (!Intro::showIfNeeded(did_show_intro, prune_MiB)) return EXIT_SUCCESS;
 
     /// 6a. Determine availability of data directory
-    if (!CheckDataDirOption()) {
+    if (!CheckDataDirOption(gArgs)) {
         InitError(strprintf(Untranslated("Specified data directory \"%s\" does not exist.\n"), gArgs.GetArg("-datadir", "")));
         QMessageBox::critical(nullptr, PACKAGE_NAME,
             QObject::tr("Error: Specified data directory \"%1\" does not exist.").arg(QString::fromStdString(gArgs.GetArg("-datadir", ""))));

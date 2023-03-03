@@ -203,7 +203,7 @@ void SendCoinsDialog::setModel(WalletModel *_model)
         if (model->wallet().hasExternalSigner()) {
             //: "device" usually means a hardware wallet.
             ui->sendButton->setText(tr("Sign on device"));
-            if (gArgs.GetArg("-signer", "") != "") {
+            if (model->getOptionsModel()->hasSigner()) {
                 ui->sendButton->setEnabled(true);
                 ui->sendButton->setToolTip(tr("Connect your hardware wallet first."));
             } else {
@@ -699,7 +699,7 @@ void SendCoinsDialog::setBalance(const interfaces::WalletBalances& balances)
         CAmount balance = balances.balance;
         if (model->wallet().hasExternalSigner()) {
             ui->labelBalanceName->setText(tr("External balance:"));
-        } else if (model->wallet().privateKeysDisabled()) {
+        } else if (model->wallet().isLegacy() && model->wallet().privateKeysDisabled()) {
             balance = balances.watch_only_balance;
             ui->labelBalanceName->setText(tr("Watch-only balance:"));
         }

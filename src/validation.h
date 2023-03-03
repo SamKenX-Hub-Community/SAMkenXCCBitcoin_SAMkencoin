@@ -267,27 +267,39 @@ PackageMempoolAcceptResult ProcessNewPackage(Chainstate& active_chainstate, CTxM
 bool CheckFinalTxAtTip(const CBlockIndex& active_chain_tip, const CTransaction& tx) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 /**
- * Check if transaction will be BIP68 final in the next block to be created on top of tip.
- * @param[in]   tip             Chain tip to check tx sequence locks against. For example,
- *                              the tip of the current active chain.
+ * Calculate LockPoints required to check if transaction will be BIP68 final in the next block
+ * to be created on top of tip.
+ *
+ * @param[in]   tip             Chain tip for which tx sequence locks are calculated. For
+ *                              example, the tip of the current active chain.
  * @param[in]   coins_view      Any CCoinsView that provides access to the relevant coins for
  *                              checking sequence locks. For example, it can be a CCoinsViewCache
  *                              that isn't connected to anything but contains all the relevant
  *                              coins, or a CCoinsViewMemPool that is connected to the
- *                              mempool and chainstate UTXO set. In the latter case, the caller is
- *                              responsible for holding the appropriate locks to ensure that
+ *                              mempool and chainstate UTXO set. In the latter case, the caller
+ *                              is responsible for holding the appropriate locks to ensure that
  *                              calls to GetCoin() return correct coins.
+ * @param[in]   tx              The transaction being evaluated.
+ *
+ * @returns The resulting height and time calculated and the hash of the block needed for
+ *          calculation, or std::nullopt if there is an error.
+ */
+std::optional<LockPoints> CalculateLockPointsAtTip(
+    CBlockIndex* tip,
+    const CCoinsView& coins_view,
+    const CTransaction& tx);
+
+/**
+ * Check if transaction will be BIP68 final in the next block to be created on top of tip.
+ * @param[in]   tip             Chain tip to check tx sequence locks against. For example,
+ *                              the tip of the current active chain.
+ * @param[in]   lock_points     LockPoints containing the height and time at which this
+ *                              transaction is final.
  * Simulates calling SequenceLocks() with data from the tip passed in.
- * Optionally stores in LockPoints the resulting height and time calculated and the hash
- * of the block needed for calculation or skips the calculation and uses the LockPoints
- * passed in for evaluation.
  * The LockPoints should not be considered valid if CheckSequenceLocksAtTip returns false.
  */
 bool CheckSequenceLocksAtTip(CBlockIndex* tip,
-                        const CCoinsView& coins_view,
-                        const CTransaction& tx,
-                        LockPoints* lp = nullptr,
-                        bool useExistingLockPoints = false);
+                             const LockPoints& lock_points);
 
 /**
  * Closure representing one script verification
@@ -349,12 +361,20 @@ bool HasValidProofOfWork(const std::vector<CBlockHeader>& headers, const Consens
 /** Return the sum of the work on a given set of headers */
 arith_uint256 CalculateHeadersWork(const std::vector<CBlockHeader>& headers);
 
+enum class VerifyDBResult {
+    SUCCESS,
+    CORRUPTED_BLOCK_DB,
+    INTERRUPTED,
+    SKIPPED_L3_CHECKS,
+    SKIPPED_MISSING_BLOCKS,
+};
+
 /** RAII wrapper for VerifyDB: Verify consistency of the block and coin databases */
 class CVerifyDB {
 public:
     CVerifyDB();
     ~CVerifyDB();
-    bool VerifyDB(
+    [[nodiscard]] VerifyDBResult VerifyDB(
         Chainstate& chainstate,
         const Consensus::Params& consensus_params,
         CCoinsView& coinsview,
@@ -408,7 +428,7 @@ public:
     //! state to disk, which should not be done until the health of the database is verified.
     //!
     //! All arguments forwarded onto CCoinsViewDB.
-    CoinsViews(fs::path ldb_name, size_t cache_size_bytes, bool in_memory, bool should_wipe);
+    CoinsViews(DBParams db_params, CoinsViewOptions options);
 
     //! Initialize the CCoinsViewCache member.
     void InitCache() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);

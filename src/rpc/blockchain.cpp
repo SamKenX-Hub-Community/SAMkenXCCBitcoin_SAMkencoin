@@ -460,7 +460,7 @@ static RPCHelpMan getblockfrompeer()
 
     // Fetching blocks before the node has syncing past their height can prevent block files from
     // being pruned, so we avoid it if the node is in prune mode.
-    if (node::fPruneMode && index->nHeight > WITH_LOCK(chainman.GetMutex(), return chainman.ActiveTip()->nHeight)) {
+    if (chainman.m_blockman.IsPruneMode() && index->nHeight > WITH_LOCK(chainman.GetMutex(), return chainman.ActiveTip()->nHeight)) {
         throw JSONRPCError(RPC_MISC_ERROR, "In prune mode, only blocks that the node has already synced previously can be fetched from a peer");
     }
 
@@ -565,7 +565,7 @@ static RPCHelpMan getblockheader()
 
     if (!fVerbose)
     {
-        CDataStream ssBlock(SER_NETWORK, PROTOCOL_VERSION);
+        DataStream ssBlock{};
         ssBlock << pblockindex->GetBlockHeader();
         std::string strHex = HexStr(ssBlock);
         return strHex;
@@ -775,10 +775,11 @@ static RPCHelpMan pruneblockchain()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
-    if (!node::fPruneMode)
-        throw JSONRPCError(RPC_MISC_ERROR, "Cannot prune blocks because node is not in prune mode.");
-
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    if (!chainman.m_blockman.IsPruneMode()) {
+        throw JSONRPCError(RPC_MISC_ERROR, "Cannot prune blocks because node is not in prune mode.");
+    }
+
     LOCK(cs_main);
     Chainstate& active_chainstate = chainman.ActiveChainstate();
     CChain& active_chain = active_chainstate.m_chain;
@@ -1109,7 +1110,7 @@ static RPCHelpMan verifychain()
                     {"nblocks", RPCArg::Type::NUM, RPCArg::DefaultHint{strprintf("%d, 0=all", DEFAULT_CHECKBLOCKS)}, "The number of blocks to check."},
                 },
                 RPCResult{
-                    RPCResult::Type::BOOL, "", "Verified or not"},
+                    RPCResult::Type::BOOL, "", "Verification finished successfully. If false, check debug.log for reason."},
                 RPCExamples{
                     HelpExampleCli("verifychain", "")
             + HelpExampleRpc("verifychain", "")
@@ -1124,7 +1125,7 @@ static RPCHelpMan verifychain()
 
     Chainstate& active_chainstate = chainman.ActiveChainstate();
     return CVerifyDB().VerifyDB(
-        active_chainstate, chainman.GetParams().GetConsensus(), active_chainstate.CoinsTip(), check_level, check_depth);
+               active_chainstate, chainman.GetParams().GetConsensus(), active_chainstate.CoinsTip(), check_level, check_depth) == VerifyDBResult::SUCCESS;
 },
     };
 }
@@ -1266,15 +1267,15 @@ RPCHelpMan getblockchaininfo()
     obj.pushKV("initialblockdownload", active_chainstate.IsInitialBlockDownload());
     obj.pushKV("chainwork", tip.nChainWork.GetHex());
     obj.pushKV("size_on_disk", chainman.m_blockman.CalculateCurrentUsage());
-    obj.pushKV("pruned", node::fPruneMode);
-    if (node::fPruneMode) {
+    obj.pushKV("pruned", chainman.m_blockman.IsPruneMode());
+    if (chainman.m_blockman.IsPruneMode()) {
         obj.pushKV("pruneheight", chainman.m_blockman.GetFirstStoredBlock(tip)->nHeight);
 
         // if 0, execution bypasses the whole if block.
         bool automatic_pruning{args.GetIntArg("-prune", 0) != 1};
         obj.pushKV("automatic_pruning",  automatic_pruning);
         if (automatic_pruning) {
-            obj.pushKV("prune_target_size",  node::nPruneTarget);
+            obj.pushKV("prune_target_size", chainman.m_blockman.GetPruneTarget());
         }
     }
 
@@ -2307,7 +2308,7 @@ static RPCHelpMan scanblocks()
             RPCArg{"start_height", RPCArg::Type::NUM, RPCArg::Default{0}, "Height to start to scan from"},
             RPCArg{"stop_height", RPCArg::Type::NUM, RPCArg::DefaultHint{"chain tip"}, "Height to stop to scan"},
             RPCArg{"filtertype", RPCArg::Type::STR, RPCArg::Default{BlockFilterTypeName(BlockFilterType::BASIC)}, "The type name of the filter"},
-            RPCArg{"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED_NAMED_ARG, "",
+            RPCArg{"options", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "",
                 {
                     {"filter_false_positives", RPCArg::Type::BOOL, RPCArg::Default{false}, "Filter false positives (slower and may fail on pruned nodes). Otherwise they may occur at a rate of 1/M"},
                 },

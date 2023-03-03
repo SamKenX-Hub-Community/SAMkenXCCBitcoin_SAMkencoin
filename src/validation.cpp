@@ -76,8 +76,6 @@ using node::BlockManager;
 using node::BlockMap;
 using node::CBlockIndexHeightOnlyComparator;
 using node::CBlockIndexWorkComparator;
-using node::fImporting;
-using node::fPruneMode;
 using node::fReindex;
 using node::ReadBlockFromDisk;
 using node::SnapshotMetadata;
@@ -159,11 +157,89 @@ bool CheckFinalTxAtTip(const CBlockIndex& active_chain_tip, const CTransaction& 
     return IsFinalTx(tx, nBlockHeight, nBlockTime);
 }
 
+namespace {
+/**
+ * A helper which calculates heights of inputs of a given transaction.
+ *
+ * @param[in] tip    The current chain tip. If an input belongs to a mempool
+ *                   transaction, we assume it will be confirmed in the next block.
+ * @param[in] coins  Any CCoinsView that provides access to the relevant coins.
+ * @param[in] tx     The transaction being evaluated.
+ *
+ * @returns A vector of input heights or nullopt, in case of an error.
+ */
+std::optional<std::vector<int>> CalculatePrevHeights(
+    const CBlockIndex& tip,
+    const CCoinsView& coins,
+    const CTransaction& tx)
+{
+    std::vector<int> prev_heights;
+    prev_heights.resize(tx.vin.size());
+    for (size_t i = 0; i < tx.vin.size(); ++i) {
+        const CTxIn& txin = tx.vin[i];
+        Coin coin;
+        if (!coins.GetCoin(txin.prevout, coin)) {
+            LogPrintf("ERROR: %s: Missing input %d in transaction \'%s\'\n", __func__, i, tx.GetHash().GetHex());
+            return std::nullopt;
+        }
+        if (coin.nHeight == MEMPOOL_HEIGHT) {
+            // Assume all mempool transaction confirm in the next block.
+            prev_heights[i] = tip.nHeight + 1;
+        } else {
+            prev_heights[i] = coin.nHeight;
+        }
+    }
+    return prev_heights;
+}
+} // namespace
+
+std::optional<LockPoints> CalculateLockPointsAtTip(
+    CBlockIndex* tip,
+    const CCoinsView& coins_view,
+    const CTransaction& tx)
+{
+    assert(tip);
+
+    auto prev_heights{CalculatePrevHeights(*tip, coins_view, tx)};
+    if (!prev_heights.has_value()) return std::nullopt;
+
+    CBlockIndex next_tip;
+    next_tip.pprev = tip;
+    // When SequenceLocks() is called within ConnectBlock(), the height
+    // of the block *being* evaluated is what is used.
+    // Thus if we want to know if a transaction can be part of the
+    // *next* block, we need to use one more than active_chainstate.m_chain.Height()
+    next_tip.nHeight = tip->nHeight + 1;
+    const auto [min_height, min_time] = CalculateSequenceLocks(tx, STANDARD_LOCKTIME_VERIFY_FLAGS, prev_heights.value(), next_tip);
+
+    // Also store the hash of the block with the highest height of
+    // all the blocks which have sequence locked prevouts.
+    // This hash needs to still be on the chain
+    // for these LockPoint calculations to be valid
+    // Note: It is impossible to correctly calculate a maxInputBlock
+    // if any of the sequence locked inputs depend on unconfirmed txs,
+    // except in the special case where the relative lock time/height
+    // is 0, which is equivalent to no sequence lock. Since we assume
+    // input height of tip+1 for mempool txs and test the resulting
+    // min_height and min_time from CalculateSequenceLocks against tip+1.
+    int max_input_height{0};
+    for (const int height : prev_heights.value()) {
+        // Can ignore mempool inputs since we'll fail if they had non-zero locks
+        if (height != next_tip.nHeight) {
+            max_input_height = std::max(max_input_height, height);
+        }
+    }
+
+    // tip->GetAncestor(max_input_height) should never return a nullptr
+    // because max_input_height is always less than the tip height.
+    // It would, however, be a bad bug to continue execution, since a
+    // LockPoints object with the maxInputBlock member set to nullptr
+    // signifies no relative lock time.
+    return LockPoints{min_height, min_time, Assert(tip->GetAncestor(max_input_height))};
+}
+
 bool CheckSequenceLocksAtTip(CBlockIndex* tip,
-                        const CCoinsView& coins_view,
-                        const CTransaction& tx,
-                        LockPoints* lp,
-                        bool useExistingLockPoints)
+                             const LockPoints& lock_points)
 {
     assert(tip != nullptr);
 
@@ -177,61 +253,7 @@ bool CheckSequenceLocksAtTip(CBlockIndex* tip,
     // *next* block, we need to use one more than active_chainstate.m_chain.Height()
     index.nHeight = tip->nHeight + 1;
 
-    std::pair<int, int64_t> lockPair;
-    if (useExistingLockPoints) {
-        assert(lp);
-        lockPair.first = lp->height;
-        lockPair.second = lp->time;
-    }
-    else {
-        std::vector<int> prevheights;
-        prevheights.resize(tx.vin.size());
-        for (size_t txinIndex = 0; txinIndex < tx.vin.size(); txinIndex++) {
-            const CTxIn& txin = tx.vin[txinIndex];
-            Coin coin;
-            if (!coins_view.GetCoin(txin.prevout, coin)) {
-                return error("%s: Missing input", __func__);
-            }
-            if (coin.nHeight == MEMPOOL_HEIGHT) {
-                // Assume all mempool transaction confirm in the next block
-                prevheights[txinIndex] = tip->nHeight + 1;
-            } else {
-                prevheights[txinIndex] = coin.nHeight;
-            }
-        }
-        lockPair = CalculateSequenceLocks(tx, STANDARD_LOCKTIME_VERIFY_FLAGS, prevheights, index);
-        if (lp) {
-            lp->height = lockPair.first;
-            lp->time = lockPair.second;
-            // Also store the hash of the block with the highest height of
-            // all the blocks which have sequence locked prevouts.
-            // This hash needs to still be on the chain
-            // for these LockPoint calculations to be valid
-            // Note: It is impossible to correctly calculate a maxInputBlock
-            // if any of the sequence locked inputs depend on unconfirmed txs,
-            // except in the special case where the relative lock time/height
-            // is 0, which is equivalent to no sequence lock. Since we assume
-            // input height of tip+1 for mempool txs and test the resulting
-            // lockPair from CalculateSequenceLocks against tip+1.  We know
-            // EvaluateSequenceLocks will fail if there was a non-zero sequence
-            // lock on a mempool input, so we can use the return value of
-            // CheckSequenceLocksAtTip to indicate the LockPoints validity
-            int maxInputHeight = 0;
-            for (const int height : prevheights) {
-                // Can ignore mempool inputs since we'll fail if they had non-zero locks
-                if (height != tip->nHeight+1) {
-                    maxInputHeight = std::max(maxInputHeight, height);
-                }
-            }
-            // tip->GetAncestor(maxInputHeight) should never return a nullptr
-            // because maxInputHeight is always less than the tip height.
-            // It would, however, be a bad bug to continue execution, since a
-            // LockPoints object with the maxInputBlock member set to nullptr
-            // signifies no relative lock time.
-            lp->maxInputBlock = Assert(tip->GetAncestor(maxInputHeight));
-        }
-    }
-    return EvaluateSequenceLocks(index, lockPair);
+    return EvaluateSequenceLocks(index, {lock_points.height, lock_points.time});
 }
 
 // Returns the script flags which should be checked for a given block
@@ -317,20 +339,23 @@ void Chainstate::MaybeUpdateMempoolForReorg(
 
         // The transaction must be final.
         if (!CheckFinalTxAtTip(*Assert(m_chain.Tip()), tx)) return true;
-        LockPoints lp = it->GetLockPoints();
-        const bool validLP{TestLockPointValidity(m_chain, lp)};
-        CCoinsViewMemPool view_mempool(&CoinsTip(), *m_mempool);
+
+        const LockPoints& lp = it->GetLockPoints();
         // CheckSequenceLocksAtTip checks if the transaction will be final in the next block to be
-        // created on top of the new chain. We use useExistingLockPoints=false so that, instead of
-        // using the information in lp (which might now refer to a block that no longer exists in
-        // the chain), it will update lp to contain LockPoints relevant to the new chain.
-        if (!CheckSequenceLocksAtTip(m_chain.Tip(), view_mempool, tx, &lp, validLP)) {
-            // If CheckSequenceLocksAtTip fails, remove the tx and don't depend on the LockPoints.
-            return true;
-        } else if (!validLP) {
-            // If CheckSequenceLocksAtTip succeeded, it also updated the LockPoints.
-            // Now update the mempool entry lockpoints as well.
-            m_mempool->mapTx.modify(it, [&lp](CTxMemPoolEntry& e) { e.UpdateLockPoints(lp); });
+        // created on top of the new chain.
+        if (TestLockPointValidity(m_chain, lp)) {
+            if (!CheckSequenceLocksAtTip(m_chain.Tip(), lp)) {
+                return true;
+            }
+        } else {
+            const CCoinsViewMemPool view_mempool{&CoinsTip(), *m_mempool};
+            const std::optional<LockPoints> new_lock_points{CalculateLockPointsAtTip(m_chain.Tip(), view_mempool, tx)};
+            if (new_lock_points.has_value() && CheckSequenceLocksAtTip(m_chain.Tip(), *new_lock_points)) {
+                // Now update the mempool entry lockpoints as well.
+                m_mempool->mapTx.modify(it, [&new_lock_points](CTxMemPoolEntry& e) { e.UpdateLockPoints(*new_lock_points); });
+            } else {
+                return true;
+            }
         }
 
         // If the transaction spends any coinbase outputs, it must be mature.
@@ -734,7 +759,6 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         }
     }
 
-    LockPoints lp;
     m_view.SetBackend(m_viewmempool);
 
     const CCoinsViewCache& coins_cache = m_active_chainstate.CoinsTip();
@@ -776,7 +800,8 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // be mined yet.
     // Pass in m_view which has all of the relevant inputs cached. Note that, since m_view's
     // backend was removed, it no longer pulls coins from the mempool.
-    if (!CheckSequenceLocksAtTip(m_active_chainstate.m_chain.Tip(), m_view, tx, &lp)) {
+    const std::optional<LockPoints> lock_points{CalculateLockPointsAtTip(m_active_chainstate.m_chain.Tip(), m_view, tx)};
+    if (!lock_points.has_value() || !CheckSequenceLocksAtTip(m_active_chainstate.m_chain.Tip(), *lock_points)) {
         return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "non-BIP68-final");
     }
 
@@ -812,7 +837,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     }
 
     entry.reset(new CTxMemPoolEntry(ptx, ws.m_base_fees, nAcceptTime, m_active_chainstate.m_chain.Height(),
-            fSpendsCoinbase, nSigOpsCost, lp));
+                                    fSpendsCoinbase, nSigOpsCost, lock_points.value()));
     ws.m_vsize = entry->GetTxSize();
 
     if (nSigOpsCost > MAX_STANDARD_TX_SIGOPS_COST)
@@ -1513,13 +1538,9 @@ CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
     return nSubsidy;
 }
 
-CoinsViews::CoinsViews(
-    fs::path ldb_name,
-    size_t cache_size_bytes,
-    bool in_memory,
-    bool should_wipe) : m_dbview(
-                            gArgs.GetDataDirNet() / ldb_name, cache_size_bytes, in_memory, should_wipe),
-                        m_catcherview(&m_dbview) {}
+CoinsViews::CoinsViews(DBParams db_params, CoinsViewOptions options)
+    : m_dbview{std::move(db_params), std::move(options)},
+      m_catcherview(&m_dbview) {}
 
 void CoinsViews::InitCache()
 {
@@ -1548,7 +1569,14 @@ void Chainstate::InitCoinsDB(
     }
 
     m_coins_views = std::make_unique<CoinsViews>(
-        leveldb_name, cache_size_bytes, in_memory, should_wipe);
+        DBParams{
+            .path = m_chainman.m_options.datadir / leveldb_name,
+            .cache_bytes = cache_size_bytes,
+            .memory_only = in_memory,
+            .wipe_data = should_wipe,
+            .obfuscate = true,
+            .options = m_chainman.m_options.coins_db},
+        m_chainman.m_options.coins_view);
 }
 
 void Chainstate::InitCoinsCache(size_t cache_size_bytes)
@@ -1573,8 +1601,9 @@ bool Chainstate::IsInitialBlockDownload() const
     LOCK(cs_main);
     if (m_cached_finished_ibd.load(std::memory_order_relaxed))
         return false;
-    if (fImporting || fReindex)
+    if (m_chainman.m_blockman.LoadingBlocks()) {
         return true;
+    }
     if (m_chain.Tip() == nullptr)
         return true;
     if (m_chain.Tip()->nChainWork < m_chainman.MinimumChainWork()) {
@@ -2411,7 +2440,7 @@ bool Chainstate::FlushStateToDisk(
 
         CoinsCacheSizeState cache_state = GetCoinsCacheSizeState();
         LOCK(m_blockman.cs_LastBlockFile);
-        if (fPruneMode && (m_blockman.m_check_for_pruning || nManualPruneHeight > 0) && !fReindex) {
+        if (m_blockman.IsPruneMode() && (m_blockman.m_check_for_pruning || nManualPruneHeight > 0) && !fReindex) {
             // make sure we don't prune above any of the prune locks bestblocks
             // pruning is height-based
             int last_prune{m_chain.Height()}; // last height we can prune
@@ -4058,7 +4087,7 @@ CVerifyDB::~CVerifyDB()
     uiInterface.ShowProgress("", 100, false);
 }
 
-bool CVerifyDB::VerifyDB(
+VerifyDBResult CVerifyDB::VerifyDB(
     Chainstate& chainstate,
     const Consensus::Params& consensus_params,
     CCoinsView& coinsview,
@@ -4067,7 +4096,7 @@ bool CVerifyDB::VerifyDB(
     AssertLockHeld(cs_main);
 
     if (chainstate.m_chain.Tip() == nullptr || chainstate.m_chain.Tip()->pprev == nullptr) {
-        return true;
+        return VerifyDBResult::SUCCESS;
     }
 
     // Verify blocks in the best chain
@@ -4082,7 +4111,9 @@ bool CVerifyDB::VerifyDB(
     int nGoodTransactions = 0;
     BlockValidationState state;
     int reportDone = 0;
-    LogPrintf("[0%%]..."); /* Continued */
+    bool skipped_no_block_data{false};
+    bool skipped_l3_checks{false};
+    LogPrintf("Verification progress: 0%%\n");
 
     const bool is_snapshot_cs{!chainstate.m_from_snapshot_blockhash};
 
@@ -4090,88 +4121,109 @@ bool CVerifyDB::VerifyDB(
         const int percentageDone = std::max(1, std::min(99, (int)(((double)(chainstate.m_chain.Height() - pindex->nHeight)) / (double)nCheckDepth * (nCheckLevel >= 4 ? 50 : 100))));
         if (reportDone < percentageDone / 10) {
             // report every 10% step
-            LogPrintf("[%d%%]...", percentageDone); /* Continued */
+            LogPrintf("Verification progress: %d%%\n", percentageDone);
             reportDone = percentageDone / 10;
         }
         uiInterface.ShowProgress(_("Verifying blocks…").translated, percentageDone, false);
         if (pindex->nHeight <= chainstate.m_chain.Height() - nCheckDepth) {
             break;
         }
-        if ((fPruneMode || is_snapshot_cs) && !(pindex->nStatus & BLOCK_HAVE_DATA)) {
+        if ((chainstate.m_blockman.IsPruneMode() || is_snapshot_cs) && !(pindex->nStatus & BLOCK_HAVE_DATA)) {
             // If pruning or running under an assumeutxo snapshot, only go
             // back as far as we have data.
-            LogPrintf("VerifyDB(): block verification stopping at height %d (pruning, no data)\n", pindex->nHeight);
+            LogPrintf("VerifyDB(): block verification stopping at height %d (no data). This could be due to pruning or use of an assumeutxo snapshot.\n", pindex->nHeight);
+            skipped_no_block_data = true;
             break;
         }
         CBlock block;
         // check level 0: read from disk
         if (!ReadBlockFromDisk(block, pindex, consensus_params)) {
-            return error("VerifyDB(): *** ReadBlockFromDisk failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
+            LogPrintf("Verification error: ReadBlockFromDisk failed at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString());
+            return VerifyDBResult::CORRUPTED_BLOCK_DB;
         }
         // check level 1: verify block validity
         if (nCheckLevel >= 1 && !CheckBlock(block, state, consensus_params)) {
-            return error("%s: *** found bad block at %d, hash=%s (%s)\n", __func__,
-                         pindex->nHeight, pindex->GetBlockHash().ToString(), state.ToString());
+            LogPrintf("Verification error: found bad block at %d, hash=%s (%s)\n",
+                      pindex->nHeight, pindex->GetBlockHash().ToString(), state.ToString());
+            return VerifyDBResult::CORRUPTED_BLOCK_DB;
         }
         // check level 2: verify undo validity
         if (nCheckLevel >= 2 && pindex) {
             CBlockUndo undo;
             if (!pindex->GetUndoPos().IsNull()) {
                 if (!UndoReadFromDisk(undo, pindex)) {
-                    return error("VerifyDB(): *** found bad undo data at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString());
+                    LogPrintf("Verification error: found bad undo data at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString());
+                    return VerifyDBResult::CORRUPTED_BLOCK_DB;
                 }
             }
         }
         // check level 3: check for inconsistencies during memory-only disconnect of tip blocks
         size_t curr_coins_usage = coins.DynamicMemoryUsage() + chainstate.CoinsTip().DynamicMemoryUsage();
 
-        if (nCheckLevel >= 3 && curr_coins_usage <= chainstate.m_coinstip_cache_size_bytes) {
-            assert(coins.GetBestBlock() == pindex->GetBlockHash());
-            DisconnectResult res = chainstate.DisconnectBlock(block, pindex, coins);
-            if (res == DISCONNECT_FAILED) {
-                return error("VerifyDB(): *** irrecoverable inconsistency in block data at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
-            }
-            if (res == DISCONNECT_UNCLEAN) {
-                nGoodTransactions = 0;
-                pindexFailure = pindex;
+        if (nCheckLevel >= 3) {
+            if (curr_coins_usage <= chainstate.m_coinstip_cache_size_bytes) {
+                assert(coins.GetBestBlock() == pindex->GetBlockHash());
+                DisconnectResult res = chainstate.DisconnectBlock(block, pindex, coins);
+                if (res == DISCONNECT_FAILED) {
+                    LogPrintf("Verification error: irrecoverable inconsistency in block data at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString());
+                    return VerifyDBResult::CORRUPTED_BLOCK_DB;
+                }
+                if (res == DISCONNECT_UNCLEAN) {
+                    nGoodTransactions = 0;
+                    pindexFailure = pindex;
+                } else {
+                    nGoodTransactions += block.vtx.size();
+                }
             } else {
-                nGoodTransactions += block.vtx.size();
+                skipped_l3_checks = true;
             }
         }
-        if (ShutdownRequested()) return true;
+        if (ShutdownRequested()) return VerifyDBResult::INTERRUPTED;
     }
     if (pindexFailure) {
-        return error("VerifyDB(): *** coin database inconsistencies found (last %i blocks, %i good transactions before that)\n", chainstate.m_chain.Height() - pindexFailure->nHeight + 1, nGoodTransactions);
+        LogPrintf("Verification error: coin database inconsistencies found (last %i blocks, %i good transactions before that)\n", chainstate.m_chain.Height() - pindexFailure->nHeight + 1, nGoodTransactions);
+        return VerifyDBResult::CORRUPTED_BLOCK_DB;
+    }
+    if (skipped_l3_checks) {
+        LogPrintf("Skipped verification of level >=3 (insufficient database cache size). Consider increasing -dbcache.\n");
     }
 
     // store block count as we move pindex at check level >= 4
     int block_count = chainstate.m_chain.Height() - pindex->nHeight;
 
     // check level 4: try reconnecting blocks
-    if (nCheckLevel >= 4) {
+    if (nCheckLevel >= 4 && !skipped_l3_checks) {
         while (pindex != chainstate.m_chain.Tip()) {
             const int percentageDone = std::max(1, std::min(99, 100 - (int)(((double)(chainstate.m_chain.Height() - pindex->nHeight)) / (double)nCheckDepth * 50)));
             if (reportDone < percentageDone / 10) {
                 // report every 10% step
-                LogPrintf("[%d%%]...", percentageDone); /* Continued */
+                LogPrintf("Verification progress: %d%%\n", percentageDone);
                 reportDone = percentageDone / 10;
             }
             uiInterface.ShowProgress(_("Verifying blocks…").translated, percentageDone, false);
             pindex = chainstate.m_chain.Next(pindex);
             CBlock block;
-            if (!ReadBlockFromDisk(block, pindex, consensus_params))
-                return error("VerifyDB(): *** ReadBlockFromDisk failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
-            if (!chainstate.ConnectBlock(block, state, pindex, coins)) {
-                return error("VerifyDB(): *** found unconnectable block at %d, hash=%s (%s)", pindex->nHeight, pindex->GetBlockHash().ToString(), state.ToString());
+            if (!ReadBlockFromDisk(block, pindex, consensus_params)) {
+                LogPrintf("Verification error: ReadBlockFromDisk failed at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString());
+                return VerifyDBResult::CORRUPTED_BLOCK_DB;
             }
-            if (ShutdownRequested()) return true;
+            if (!chainstate.ConnectBlock(block, state, pindex, coins)) {
+                LogPrintf("Verification error: found unconnectable block at %d, hash=%s (%s)\n", pindex->nHeight, pindex->GetBlockHash().ToString(), state.ToString());
+                return VerifyDBResult::CORRUPTED_BLOCK_DB;
+            }
+            if (ShutdownRequested()) return VerifyDBResult::INTERRUPTED;
         }
     }
 
-    LogPrintf("[DONE].\n");
-    LogPrintf("No coin database inconsistencies in last %i blocks (%i transactions)\n", block_count, nGoodTransactions);
+    LogPrintf("Verification: No coin database inconsistencies in last %i blocks (%i transactions)\n", block_count, nGoodTransactions);
 
-    return true;
+    if (skipped_l3_checks) {
+        return VerifyDBResult::SKIPPED_L3_CHECKS;
+    }
+    if (skipped_no_block_data) {
+        return VerifyDBResult::SKIPPED_MISSING_BLOCKS;
+    }
+    return VerifyDBResult::SUCCESS;
 }
 
 /** Apply the effects of a block on the utxo cache, ignoring that it may already have been applied. */
@@ -4297,6 +4349,8 @@ bool ChainstateManager::LoadBlockIndex()
     if (!fReindex) {
         bool ret = m_blockman.LoadBlockIndexDB(GetConsensus());
         if (!ret) return false;
+
+        m_blockman.ScanAndUnlinkAlreadyPrunedFiles();
 
         std::vector<CBlockIndex*> vSortedByHeight{m_blockman.GetAllBlockIndices()};
         std::sort(vSortedByHeight.begin(), vSortedByHeight.end(),

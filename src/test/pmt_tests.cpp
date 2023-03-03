@@ -6,6 +6,7 @@
 #include <merkleblock.h>
 #include <serialize.h>
 #include <streams.h>
+#include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
 #include <version.h>
@@ -69,7 +70,7 @@ BOOST_AUTO_TEST_CASE(pmt_test1)
             CPartialMerkleTree pmt1(vTxid, vMatch);
 
             // serialize
-            CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+            DataStream ss{};
             ss << pmt1;
 
             // verify CPartialMerkleTree's size guarantees

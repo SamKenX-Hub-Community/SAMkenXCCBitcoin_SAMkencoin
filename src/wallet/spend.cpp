@@ -30,11 +30,11 @@ using interfaces::FoundBlock;
 namespace wallet {
 static constexpr size_t OUTPUT_GROUP_MAX_ENTRIES{100};
 
-int CalculateMaximumSignedInputSize(const CTxOut& txout, const COutPoint outpoint, const SigningProvider* provider, const CCoinControl* coin_control)
+int CalculateMaximumSignedInputSize(const CTxOut& txout, const COutPoint outpoint, const SigningProvider* provider, bool can_grind_r, const CCoinControl* coin_control)
 {
     CMutableTransaction txn;
     txn.vin.push_back(CTxIn(outpoint));
-    if (!provider || !DummySignInput(*provider, txn.vin[0], txout, coin_control)) {
+    if (!provider || !DummySignInput(*provider, txn.vin[0], txout, can_grind_r, coin_control)) {
         return -1;
     }
     return GetVirtualTransactionInputSize(txn.vin[0]);
@@ -43,7 +43,7 @@ int CalculateMaximumSignedInputSize(const CTxOut& txout, const COutPoint outpoin
 int CalculateMaximumSignedInputSize(const CTxOut& txout, const CWallet* wallet, const CCoinControl* coin_control)
 {
     const std::unique_ptr<SigningProvider> provider = wallet->GetSolvingProvider(txout.scriptPubKey);
-    return CalculateMaximumSignedInputSize(txout, COutPoint(), provider.get(), coin_control);
+    return CalculateMaximumSignedInputSize(txout, COutPoint(), provider.get(), wallet->CanGrindR(), coin_control);
 }
 
 // txouts needs to be in the order of tx.vin
@@ -163,6 +163,7 @@ util::Result<PreSelectedInputs> FetchSelectedInputs(const CWallet& wallet, const
     PreSelectedInputs result;
     std::vector<COutPoint> vPresetInputs;
     coin_control.ListSelected(vPresetInputs);
+    const bool can_grind_r = wallet.CanGrindR();
     for (const COutPoint& outpoint : vPresetInputs) {
         int input_bytes = -1;
         CTxOut txout;
@@ -181,7 +182,7 @@ util::Result<PreSelectedInputs> FetchSelectedInputs(const CWallet& wallet, const
         }
 
         if (input_bytes == -1) {
-            input_bytes = CalculateMaximumSignedInputSize(txout, outpoint, &coin_control.m_external_provider, &coin_control);
+            input_bytes = CalculateMaximumSignedInputSize(txout, outpoint, &coin_control.m_external_provider, can_grind_r, &coin_control);
         }
 
         // If available, override calculated size with coin control specified size
@@ -214,6 +215,7 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     const int min_depth = {coinControl ? coinControl->m_min_depth : DEFAULT_MIN_DEPTH};
     const int max_depth = {coinControl ? coinControl->m_max_depth : DEFAULT_MAX_DEPTH};
     const bool only_safe = {coinControl ? !coinControl->m_include_unsafe_inputs : true};
+    const bool can_grind_r = wallet.CanGrindR();
 
     std::set<uint256> trusted_parents;
     for (const auto& entry : wallet.mapWallet)
@@ -305,10 +307,8 @@ CoinsResult AvailableCoins(const CWallet& wallet,
 
             std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(output.scriptPubKey);
 
-            int input_bytes = CalculateMaximumSignedInputSize(output, COutPoint(), provider.get(), coinControl);
-            // Because CalculateMaximumSignedInputSize just uses ProduceSignature and makes a dummy signature,
-            // it is safe to assume that this input is solvable if input_bytes is greater -1.
-            bool solvable = input_bytes > -1;
+            int input_bytes = CalculateMaximumSignedInputSize(output, COutPoint(), provider.get(), can_grind_r, coinControl);
+            bool solvable = provider ? InferDescriptor(output.scriptPubKey, *provider)->IsSolvable() : false;
             bool spendable = ((mine & ISMINE_SPENDABLE) != ISMINE_NO) || (((mine & ISMINE_WATCH_ONLY) != ISMINE_NO) && (coinControl && coinControl->fAllowWatchOnly && solvable));
 
             // Filter by spendable outputs only
@@ -830,7 +830,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     coin_selection_params.change_output_size = GetSerializeSize(change_prototype_txout);
 
     // Get size of spending the change output
-    int change_spend_size = CalculateMaximumSignedInputSize(change_prototype_txout, &wallet);
+    int change_spend_size = CalculateMaximumSignedInputSize(change_prototype_txout, &wallet, /*coin_control=*/nullptr);
     // If the wallet doesn't know how to sign change output, assume p2sh-p2wpkh
     // as lower-bound to allow BnB to do it's thing
     if (change_spend_size == -1) {
@@ -1092,6 +1092,13 @@ util::Result<CreatedTransactionResult> CreateTransaction(
         TRACE1(coin_selection, attempting_aps_create_tx, wallet.GetName().c_str());
         CCoinControl tmp_cc = coin_control;
         tmp_cc.m_avoid_partial_spends = true;
+
+        // Re-use the change destination from the first creation attempt to avoid skipping BIP44 indexes
+        const int ungrouped_change_pos = txr_ungrouped.change_pos;
+        if (ungrouped_change_pos != -1) {
+            ExtractDestination(txr_ungrouped.tx->vout[ungrouped_change_pos].scriptPubKey, tmp_cc.destChange);
+        }
+
         auto txr_grouped = CreateTransactionInternal(wallet, vecSend, change_pos, tmp_cc, sign);
         // if fee of this alternative one is within the range of the max fee, we use this one
         const bool use_aps{txr_grouped.has_value() ? (txr_grouped->fee <= txr_ungrouped.fee + wallet.m_max_aps_fee) : false};
