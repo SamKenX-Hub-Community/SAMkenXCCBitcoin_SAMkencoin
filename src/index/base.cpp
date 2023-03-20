@@ -6,6 +6,7 @@
 #include <index/base.h>
 #include <interfaces/chain.h>
 #include <kernel/chain.h>
+#include <logging.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
 #include <node/database_args.h>
@@ -35,7 +36,7 @@ static void FatalError(const char* fmt, const Args&... args)
     std::string strMessage = tfm::format(fmt, args...);
     SetMiscWarning(Untranslated(strMessage));
     LogPrintf("*** %s\n", strMessage);
-    AbortError(_("A fatal internal error occurred, see debug.log for details"));
+    InitError(_("A fatal internal error occurred, see debug.log for details"));
     StartShutdown();
 }
 

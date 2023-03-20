@@ -19,12 +19,10 @@
 #include <fs.h>
 #include <logging.h>
 #include <sync.h>
-#include <tinyformat.h>
 #include <util/settings.h>
 #include <util/time.h>
 
 #include <any>
-#include <exception>
 #include <map>
 #include <optional>
 #include <set>
@@ -44,15 +42,6 @@ extern const char * const BITCOIN_SETTINGS_FILENAME;
 
 void SetupEnvironment();
 bool SetupNetworking();
-
-template<typename... Args>
-bool error(const char* fmt, const Args&... args)
-{
-    LogPrintf("ERROR: %s\n", tfm::format(fmt, args...));
-    return false;
-}
-
-void PrintExceptionContinue(const std::exception* pex, std::string_view thread_name);
 
 /**
  * Ensure file contents are fully committed to disk, using a platform-specific
@@ -435,13 +424,6 @@ protected:
     std::optional<unsigned int> GetArgFlags(const std::string& name) const;
 
     /**
-     * Read and update settings file with saved settings. This needs to be
-     * called after SelectParams() because the settings file location is
-     * network-specific.
-     */
-    bool InitSettings(std::string& error);
-
-    /**
      * Get settings file path, or return false if read-write settings were
      * disabled with -nosettings.
      */
@@ -479,12 +461,6 @@ protected:
      * useful for troubleshooting.
      */
     void LogArgs() const;
-
-    /**
-     * If datadir does not exist, create it along with wallets/
-     * subdirectory(s).
-     */
-    void EnsureDataDir() const;
 
 private:
     /**
