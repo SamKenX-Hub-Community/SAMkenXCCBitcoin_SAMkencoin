@@ -236,6 +236,14 @@ public:
     std::string m_type;
 
     CNetMessage(CDataStream&& recv_in) : m_recv(std::move(recv_in)) {}
+    // Only one CNetMessage object will exist for the same message on either
+    // the receive or processing queue. For performance reasons we therefore
+    // delete the copy constructor and assignment operator to avoid the
+    // possibility of copying CNetMessage objects.
+    CNetMessage(CNetMessage&&) = default;
+    CNetMessage(const CNetMessage&) = delete;
+    CNetMessage& operator=(CNetMessage&&) = default;
+    CNetMessage& operator=(const CNetMessage&) = delete;
 
     void SetVersion(int nVersionIn)
     {
@@ -342,14 +350,12 @@ struct CNodeOptions
     NetPermissionFlags permission_flags = NetPermissionFlags::None;
     std::unique_ptr<i2p::sam::Session> i2p_sam_session = nullptr;
     bool prefer_evict = false;
+    size_t recv_flood_size{DEFAULT_MAXRECEIVEBUFFER * 1000};
 };
 
 /** Information about a peer */
 class CNode
 {
-    friend class CConnman;
-    friend struct ConnmanTestMsg;
-
 public:
     const std::unique_ptr<TransportDeserializer> m_deserializer; // Used only by SocketHandler thread
     const std::unique_ptr<const TransportSerializer> m_serializer;
@@ -375,10 +381,6 @@ public:
     Mutex cs_vSend;
     Mutex m_sock_mutex;
     Mutex cs_vRecv;
-
-    RecursiveMutex cs_vProcessMsg;
-    std::list<CNetMessage> vProcessMsg GUARDED_BY(cs_vProcessMsg);
-    size_t nProcessQueueSize GUARDED_BY(cs_vProcessMsg){0};
 
     uint64_t nRecvBytes GUARDED_BY(cs_vRecv){0};
 
@@ -416,6 +418,27 @@ public:
     const uint64_t nKeyedNetGroup;
     std::atomic_bool fPauseRecv{false};
     std::atomic_bool fPauseSend{false};
+
+    const ConnectionType m_conn_type;
+
+    /** Move all messages from the received queue to the processing queue. */
+    void MarkReceivedMsgsForProcessing()
+        EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
+
+    /** Poll the next message from the processing queue of this connection.
+     *
+     * Returns std::nullopt if the processing queue is empty, or a pair
+     * consisting of the message and a bool that indicates if the processing
+     * queue has more entries. */
+    std::optional<std::pair<CNetMessage, bool>> PollMessage()
+        EXCLUSIVE_LOCKS_REQUIRED(!m_msg_process_queue_mutex);
+
+    /** Account for the total size of a sent message in the per msg type connection stats. */
+    void AccountForSentBytes(const std::string& msg_type, size_t sent_bytes)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_vSend)
+    {
+        mapSendBytesPerMsgType[msg_type] += sent_bytes;
+    }
 
     bool IsOutboundOrBlockRelayConn() const {
         switch (m_conn_type) {
@@ -597,10 +620,14 @@ public:
 private:
     const NodeId id;
     const uint64_t nLocalHostNonce;
-    const ConnectionType m_conn_type;
     std::atomic<int> m_greatest_common_version{INIT_PROTO_VERSION};
 
+    const size_t m_recv_flood_size;
     std::list<CNetMessage> vRecvMsg; // Used only by SocketHandler thread
+
+    Mutex m_msg_process_queue_mutex;
+    std::list<CNetMessage> m_msg_process_queue GUARDED_BY(m_msg_process_queue_mutex);
+    size_t m_msg_process_queue_size GUARDED_BY(m_msg_process_queue_mutex){0};
 
     // Our address, as reported by the peer
     CService addrLocal GUARDED_BY(m_addr_local_mutex);
@@ -857,8 +884,6 @@ public:
 
     /** Get a unique deterministic randomizer. */
     CSipHasher GetDeterministicRandomizer(uint64_t id) const;
-
-    unsigned int GetReceiveFloodSize() const;
 
     void WakeMessageHandler() EXCLUSIVE_LOCKS_REQUIRED(!mutexMsgProc);
 
