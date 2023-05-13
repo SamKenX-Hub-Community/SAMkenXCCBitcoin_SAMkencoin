@@ -11,6 +11,7 @@
 #include <arith_uint256.h>
 #include <chain.h>
 #include <checkqueue.h>
+#include <common/args.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <consensus/merkle.h>
@@ -78,10 +79,7 @@ using node::BlockMap;
 using node::CBlockIndexHeightOnlyComparator;
 using node::CBlockIndexWorkComparator;
 using node::fReindex;
-using node::ReadBlockFromDisk;
 using node::SnapshotMetadata;
-using node::UndoReadFromDisk;
-using node::UnlinkPrunedFiles;
 
 /** Maximum kilobytes for transactions to store for processing during reorg */
 static const unsigned int MAX_DISCONNECTED_TX_POOL_SIZE = 20000;
@@ -845,9 +843,18 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "bad-txns-too-many-sigops",
                 strprintf("%d", nSigOpsCost));
 
-    // No individual transactions are allowed below the min relay feerate and mempool min feerate except from
-    // disconnected blocks and transactions in a package. Package transactions will be checked using
-    // package feerate later.
+    // No individual transactions are allowed below the min relay feerate except from disconnected blocks.
+    // This requirement, unlike CheckFeeRate, cannot be bypassed using m_package_feerates because,
+    // while a tx could be package CPFP'd when entering the mempool, we do not have a DoS-resistant
+    // method of ensuring the tx remains bumped. For example, the fee-bumping child could disappear
+    // due to a replacement.
+    if (!bypass_limits && ws.m_modified_fees < m_pool.m_min_relay_feerate.GetFee(ws.m_vsize)) {
+        return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "min relay fee not met",
+                             strprintf("%d < %d", ws.m_modified_fees, m_pool.m_min_relay_feerate.GetFee(ws.m_vsize)));
+    }
+    // No individual transactions are allowed below the mempool min feerate except from disconnected
+    // blocks and transactions in a package. Package transactions will be checked using package
+    // feerate later.
     if (!bypass_limits && !args.m_package_feerates && !CheckFeeRate(ws.m_vsize, ws.m_modified_fees, state)) return false;
 
     ws.m_iters_conflicting = m_pool.GetIterSet(ws.m_conflicts);
@@ -1191,6 +1198,7 @@ bool MemPoolAccept::SubmitPackage(const ATMPArgs& args, std::vector<Workspace>& 
         } else {
             all_submitted = false;
             ws.m_state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "mempool full");
+            package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
             results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
         }
     }
@@ -1903,7 +1911,7 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
     bool fClean = true;
 
     CBlockUndo blockUndo;
-    if (!UndoReadFromDisk(blockUndo, pindex)) {
+    if (!m_blockman.UndoReadFromDisk(blockUndo, *pindex)) {
         error("DisconnectBlock(): failure reading undo data");
         return DISCONNECT_FAILED;
     }
@@ -2363,7 +2371,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     if (fJustCheck)
         return true;
 
-    if (!m_blockman.WriteUndoDataForBlock(blockundo, state, pindex, params)) {
+    if (!m_blockman.WriteUndoDataForBlock(blockundo, state, *pindex)) {
         return false;
     }
 
@@ -2534,7 +2542,7 @@ bool Chainstate::FlushStateToDisk(
             if (fFlushForPrune) {
                 LOG_TIME_MILLIS_WITH_CATEGORY("unlink pruned files", BCLog::BENCH);
 
-                UnlinkPrunedFiles(setFilesToPrune);
+                m_blockman.UnlinkPrunedFiles(setFilesToPrune);
             }
             m_last_write = nNow;
         }
@@ -2698,7 +2706,7 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     // Read block from disk.
     std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
     CBlock& block = *pblock;
-    if (!ReadBlockFromDisk(block, pindexDelete, m_chainman.GetConsensus())) {
+    if (!m_blockman.ReadBlockFromDisk(block, *pindexDelete)) {
         return error("DisconnectTip(): Failed to read block");
     }
     // Apply the block atomically to the chain state.
@@ -2815,7 +2823,7 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
     std::shared_ptr<const CBlock> pthisBlock;
     if (!pblock) {
         std::shared_ptr<CBlock> pblockNew = std::make_shared<CBlock>();
-        if (!ReadBlockFromDisk(*pblockNew, pindexNew, m_chainman.GetConsensus())) {
+        if (!m_blockman.ReadBlockFromDisk(*pblockNew, *pindexNew)) {
             return AbortNode(state, "Failed to read block");
         }
         pthisBlock = pblockNew;
@@ -3989,7 +3997,7 @@ bool Chainstate::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockV
     // Write block to history file
     if (fNewBlock) *fNewBlock = true;
     try {
-        FlatFilePos blockPos{m_blockman.SaveBlockToDisk(block, pindex->nHeight, m_chain, params, dbp)};
+        FlatFilePos blockPos{m_blockman.SaveBlockToDisk(block, pindex->nHeight, m_chain, dbp)};
         if (blockPos.IsNull()) {
             state.Error(strprintf("%s: Failed to find position to write new block to disk", __func__));
             return false;
@@ -4197,7 +4205,7 @@ VerifyDBResult CVerifyDB::VerifyDB(
         }
         CBlock block;
         // check level 0: read from disk
-        if (!ReadBlockFromDisk(block, pindex, consensus_params)) {
+        if (!chainstate.m_blockman.ReadBlockFromDisk(block, *pindex)) {
             LogPrintf("Verification error: ReadBlockFromDisk failed at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString());
             return VerifyDBResult::CORRUPTED_BLOCK_DB;
         }
@@ -4211,7 +4219,7 @@ VerifyDBResult CVerifyDB::VerifyDB(
         if (nCheckLevel >= 2 && pindex) {
             CBlockUndo undo;
             if (!pindex->GetUndoPos().IsNull()) {
-                if (!UndoReadFromDisk(undo, pindex)) {
+                if (!chainstate.m_blockman.UndoReadFromDisk(undo, *pindex)) {
                     LogPrintf("Verification error: found bad undo data at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString());
                     return VerifyDBResult::CORRUPTED_BLOCK_DB;
                 }
@@ -4263,7 +4271,7 @@ VerifyDBResult CVerifyDB::VerifyDB(
             uiInterface.ShowProgress(_("Verifying blocks…").translated, percentageDone, false);
             pindex = chainstate.m_chain.Next(pindex);
             CBlock block;
-            if (!ReadBlockFromDisk(block, pindex, consensus_params)) {
+            if (!chainstate.m_blockman.ReadBlockFromDisk(block, *pindex)) {
                 LogPrintf("Verification error: ReadBlockFromDisk failed at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString());
                 return VerifyDBResult::CORRUPTED_BLOCK_DB;
             }
@@ -4292,7 +4300,7 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
     AssertLockHeld(cs_main);
     // TODO: merge with ConnectBlock
     CBlock block;
-    if (!ReadBlockFromDisk(block, pindex, m_chainman.GetConsensus())) {
+    if (!m_blockman.ReadBlockFromDisk(block, *pindex)) {
         return error("ReplayBlock(): ReadBlockFromDisk failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
     }
 
@@ -4344,7 +4352,7 @@ bool Chainstate::ReplayBlocks()
     while (pindexOld != pindexFork) {
         if (pindexOld->nHeight > 0) { // Never disconnect the genesis block.
             CBlock block;
-            if (!ReadBlockFromDisk(block, pindexOld, m_chainman.GetConsensus())) {
+            if (!m_blockman.ReadBlockFromDisk(block, *pindexOld)) {
                 return error("RollbackBlock(): ReadBlockFromDisk() failed at %d, hash=%s", pindexOld->nHeight, pindexOld->GetBlockHash().ToString());
             }
             LogPrintf("Rolling back %s (%i)\n", pindexOld->GetBlockHash().ToString(), pindexOld->nHeight);
@@ -4407,7 +4415,7 @@ bool ChainstateManager::LoadBlockIndex()
     // Load block index from databases
     bool needs_init = fReindex;
     if (!fReindex) {
-        bool ret = m_blockman.LoadBlockIndexDB(GetConsensus());
+        bool ret{m_blockman.LoadBlockIndexDB()};
         if (!ret) return false;
 
         m_blockman.ScanAndUnlinkAlreadyPrunedFiles();
@@ -4511,7 +4519,7 @@ bool Chainstate::LoadGenesisBlock()
 
     try {
         const CBlock& block = params.GenesisBlock();
-        FlatFilePos blockPos{m_blockman.SaveBlockToDisk(block, 0, m_chain, params, nullptr)};
+        FlatFilePos blockPos{m_blockman.SaveBlockToDisk(block, 0, m_chain, nullptr)};
         if (blockPos.IsNull()) {
             return error("%s: writing genesis block to disk failed", __func__);
         }
@@ -4554,7 +4562,7 @@ void Chainstate::LoadExternalBlockFile(
             try {
                 // locate a header
                 unsigned char buf[CMessageHeader::MESSAGE_START_SIZE];
-                blkdat.FindByte(params.MessageStart()[0]);
+                blkdat.FindByte(std::byte(params.MessageStart()[0]));
                 nRewind = blkdat.GetPos() + 1;
                 blkdat >> buf;
                 if (memcmp(buf, params.MessageStart(), CMessageHeader::MESSAGE_START_SIZE)) {
@@ -4582,6 +4590,9 @@ void Chainstate::LoadExternalBlockFile(
                 // next block, but it's still possible to rewind to the start of the current block (without a disk read).
                 nRewind = nBlockPos + nSize;
                 blkdat.SkipTo(nRewind);
+
+                std::shared_ptr<CBlock> pblock{}; // needs to remain available after the cs_main lock is released to avoid duplicate reads from disk
+
                 {
                     LOCK(cs_main);
                     // detect out of order blocks, and store them for later
@@ -4599,7 +4610,7 @@ void Chainstate::LoadExternalBlockFile(
                     if (!pindex || (pindex->nStatus & BLOCK_HAVE_DATA) == 0) {
                         // This block can be processed immediately; rewind to its start, read and deserialize it.
                         blkdat.SetPos(nBlockPos);
-                        std::shared_ptr<CBlock> pblock{std::make_shared<CBlock>()};
+                        pblock = std::make_shared<CBlock>();
                         blkdat >> *pblock;
                         nRewind = blkdat.GetPos();
 
@@ -4623,6 +4634,21 @@ void Chainstate::LoadExternalBlockFile(
                     }
                 }
 
+                if (m_blockman.IsPruneMode() && !fReindex && pblock) {
+                    // must update the tip for pruning to work while importing with -loadblock.
+                    // this is a tradeoff to conserve disk space at the expense of time
+                    // spent updating the tip to be able to prune.
+                    // otherwise, ActivateBestChain won't be called by the import process
+                    // until after all of the block files are loaded. ActivateBestChain can be
+                    // called by concurrent network message processing. but, that is not
+                    // reliable for the purpose of pruning while importing.
+                    BlockValidationState state;
+                    if (!ActivateBestChain(state, pblock)) {
+                        LogPrint(BCLog::REINDEX, "failed to activate chain (%s)\n", state.ToString());
+                        break;
+                    }
+                }
+
                 NotifyHeaderTip(*this);
 
                 if (!blocks_with_unknown_parent) continue;
@@ -4637,7 +4663,7 @@ void Chainstate::LoadExternalBlockFile(
                     while (range.first != range.second) {
                         std::multimap<uint256, FlatFilePos>::iterator it = range.first;
                         std::shared_ptr<CBlock> pblockrecursive = std::make_shared<CBlock>();
-                        if (ReadBlockFromDisk(*pblockrecursive, it->second, params.GetConsensus())) {
+                        if (m_blockman.ReadBlockFromDisk(*pblockrecursive, it->second)) {
                             LogPrint(BCLog::REINDEX, "%s: Processing out of order child %s of %s\n", __func__, pblockrecursive->GetHash().ToString(),
                                     head.ToString());
                             LOCK(cs_main);
@@ -4931,7 +4957,6 @@ bool Chainstate::ResizeCoinsCaches(size_t coinstip_size, size_t coinsdb_size)
     } else {
         // Otherwise, flush state to disk and deallocate the in-memory coins map.
         ret = FlushStateToDisk(state, FlushStateMode::ALWAYS);
-        CoinsTip().ReallocateCache();
     }
     return ret;
 }

@@ -397,17 +397,15 @@ class PSBTTest(BitcoinTestFramework):
         self.nodes[0].decodepsbt(new_psbt)
 
         # Make sure that a non-psbt with signatures cannot be converted
-        # Error could be either "TX decode failed" (segwit inputs causes parsing to fail) or "Inputs must not have scriptSigs and scriptWitnesses"
-        # We must set iswitness=True because the serialized transaction has inputs and is therefore a witness transaction
         signedtx = self.nodes[0].signrawtransactionwithwallet(rawtx['hex'])
-        assert_raises_rpc_error(-22, "", self.nodes[0].converttopsbt, hexstring=signedtx['hex'], iswitness=True)
-        assert_raises_rpc_error(-22, "", self.nodes[0].converttopsbt, hexstring=signedtx['hex'], permitsigdata=False, iswitness=True)
+        assert_raises_rpc_error(-22, "Inputs must not have scriptSigs and scriptWitnesses",
+                                self.nodes[0].converttopsbt, hexstring=signedtx['hex'])  # permitsigdata=False by default
+        assert_raises_rpc_error(-22, "Inputs must not have scriptSigs and scriptWitnesses",
+                                self.nodes[0].converttopsbt, hexstring=signedtx['hex'], permitsigdata=False)
+        assert_raises_rpc_error(-22, "Inputs must not have scriptSigs and scriptWitnesses",
+                                self.nodes[0].converttopsbt, hexstring=signedtx['hex'], permitsigdata=False, iswitness=True)
         # Unless we allow it to convert and strip signatures
-        self.nodes[0].converttopsbt(signedtx['hex'], True)
-
-        # Explicitly allow converting non-empty txs
-        new_psbt = self.nodes[0].converttopsbt(rawtx['hex'])
-        self.nodes[0].decodepsbt(new_psbt)
+        self.nodes[0].converttopsbt(hexstring=signedtx['hex'], permitsigdata=True)
 
         # Create outputs to nodes 1 and 2
         node1_addr = self.nodes[1].getnewaddress()
@@ -621,17 +619,17 @@ class PSBTTest(BitcoinTestFramework):
         # Bech32 inputs should be filled with witness UTXO. Other inputs should not be filled because they are non-witness
         updated = self.nodes[1].utxoupdatepsbt(psbt)
         decoded = self.nodes[1].decodepsbt(updated)
-        test_psbt_input_keys(decoded['inputs'][0], ['witness_utxo'])
-        test_psbt_input_keys(decoded['inputs'][1], [])
-        test_psbt_input_keys(decoded['inputs'][2], [])
+        test_psbt_input_keys(decoded['inputs'][0], ['witness_utxo', 'non_witness_utxo'])
+        test_psbt_input_keys(decoded['inputs'][1], ['non_witness_utxo'])
+        test_psbt_input_keys(decoded['inputs'][2], ['non_witness_utxo'])
 
         # Try again, now while providing descriptors, making P2SH-segwit work, and causing bip32_derivs and redeem_script to be filled in
         descs = [self.nodes[1].getaddressinfo(addr)['desc'] for addr in [addr1,addr2,addr3]]
         updated = self.nodes[1].utxoupdatepsbt(psbt=psbt, descriptors=descs)
         decoded = self.nodes[1].decodepsbt(updated)
-        test_psbt_input_keys(decoded['inputs'][0], ['witness_utxo', 'bip32_derivs'])
-        test_psbt_input_keys(decoded['inputs'][1], [])
-        test_psbt_input_keys(decoded['inputs'][2], ['witness_utxo', 'bip32_derivs', 'redeem_script'])
+        test_psbt_input_keys(decoded['inputs'][0], ['witness_utxo', 'non_witness_utxo', 'bip32_derivs'])
+        test_psbt_input_keys(decoded['inputs'][1], ['non_witness_utxo', 'bip32_derivs'])
+        test_psbt_input_keys(decoded['inputs'][2], ['non_witness_utxo','witness_utxo', 'bip32_derivs', 'redeem_script'])
 
         # Two PSBTs with a common input should not be joinable
         psbt1 = self.nodes[1].createpsbt([{"txid":txid1, "vout":vout1}], {self.nodes[0].getnewaddress():Decimal('10.999')})
