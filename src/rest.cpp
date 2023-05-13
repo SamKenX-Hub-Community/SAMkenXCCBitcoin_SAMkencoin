@@ -36,7 +36,6 @@
 
 using node::GetTransaction;
 using node::NodeContext;
-using node::ReadBlockFromDisk;
 
 static const size_t MAX_GETUTXOS_OUTPOINTS = 15; //allow a max of 15 outpoints to be queried at once
 static constexpr unsigned int MAX_REST_HEADERS_RESULTS = 2000;
@@ -200,7 +199,11 @@ static bool rest_headers(const std::any& context,
     } else if (path.size() == 1) {
         // new path with query parameter: /rest/headers/<hash>?count=<count>
         hashStr = path[0];
-        raw_count = req->GetQueryParameter("count").value_or("5");
+        try {
+            raw_count = req->GetQueryParameter("count").value_or("5");
+        } catch (const std::runtime_error& e) {
+            return RESTERR(req, HTTP_BAD_REQUEST, e.what());
+        }
     } else {
         return RESTERR(req, HTTP_BAD_REQUEST, "Invalid URI format. Expected /rest/headers/<hash>.<ext>?count=<count>");
     }
@@ -307,7 +310,7 @@ static bool rest_block(const std::any& context,
 
     }
 
-    if (!ReadBlockFromDisk(block, pblockindex, chainman.GetParams().GetConsensus())) {
+    if (!chainman.m_blockman.ReadBlockFromDisk(block, *pblockindex)) {
         return RESTERR(req, HTTP_NOT_FOUND, hashStr + " not found");
     }
 
@@ -371,7 +374,11 @@ static bool rest_filter_header(const std::any& context, HTTPRequest* req, const 
     } else if (uri_parts.size() == 2) {
         // new path with query parameter: /rest/blockfilterheaders/<filtertype>/<blockhash>?count=<count>
         raw_blockhash = uri_parts[1];
-        raw_count = req->GetQueryParameter("count").value_or("5");
+        try {
+            raw_count = req->GetQueryParameter("count").value_or("5");
+        } catch (const std::runtime_error& e) {
+            return RESTERR(req, HTTP_BAD_REQUEST, e.what());
+        }
     } else {
         return RESTERR(req, HTTP_BAD_REQUEST, "Invalid URI format. Expected /rest/blockfilterheaders/<filtertype>/<blockhash>.<ext>?count=<count>");
     }
@@ -652,11 +659,21 @@ static bool rest_mempool(const std::any& context, HTTPRequest* req, const std::s
     case RESTResponseFormat::JSON: {
         std::string str_json;
         if (param == "contents") {
-            const std::string raw_verbose{req->GetQueryParameter("verbose").value_or("true")};
+            std::string raw_verbose;
+            try {
+                raw_verbose = req->GetQueryParameter("verbose").value_or("true");
+            } catch (const std::runtime_error& e) {
+                return RESTERR(req, HTTP_BAD_REQUEST, e.what());
+            }
             if (raw_verbose != "true" && raw_verbose != "false") {
                 return RESTERR(req, HTTP_BAD_REQUEST, "The \"verbose\" query parameter must be either \"true\" or \"false\".");
             }
-            const std::string raw_mempool_sequence{req->GetQueryParameter("mempool_sequence").value_or("false")};
+            std::string raw_mempool_sequence;
+            try {
+                raw_mempool_sequence = req->GetQueryParameter("mempool_sequence").value_or("false");
+            } catch (const std::runtime_error& e) {
+                return RESTERR(req, HTTP_BAD_REQUEST, e.what());
+            }
             if (raw_mempool_sequence != "true" && raw_mempool_sequence != "false") {
                 return RESTERR(req, HTTP_BAD_REQUEST, "The \"mempool_sequence\" query parameter must be either \"true\" or \"false\".");
             }
@@ -698,7 +715,7 @@ static bool rest_tx(const std::any& context, HTTPRequest* req, const std::string
     const NodeContext* const node = GetNodeContext(context, req);
     if (!node) return false;
     uint256 hashBlock = uint256();
-    const CTransactionRef tx = GetTransaction(/*block_index=*/nullptr, node->mempool.get(), hash, Params().GetConsensus(), hashBlock);
+    const CTransactionRef tx = GetTransaction(/*block_index=*/nullptr, node->mempool.get(), hash, hashBlock, node->chainman->m_blockman);
     if (!tx) {
         return RESTERR(req, HTTP_NOT_FOUND, hashStr + " not found");
     }

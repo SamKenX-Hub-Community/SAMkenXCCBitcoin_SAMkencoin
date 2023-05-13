@@ -10,6 +10,7 @@
 #include <blockencodings.h>
 #include <blockfilter.h>
 #include <chainparams.h>
+#include <common/args.h>
 #include <consensus/amount.h>
 #include <consensus/validation.h>
 #include <deploymentstatus.h>
@@ -39,7 +40,6 @@
 #include <txrequest.h>
 #include <util/check.h> // For NDEBUG compile time check
 #include <util/strencodings.h>
-#include <util/system.h>
 #include <util/trace.h>
 #include <validation.h>
 
@@ -50,9 +50,6 @@
 #include <memory>
 #include <optional>
 #include <typeinfo>
-
-using node::ReadBlockFromDisk;
-using node::ReadRawBlockFromDisk;
 
 /** How long to cache transactions in mapRelay for normal relay */
 static constexpr auto RELAY_TX_CACHE_TIME = 15min;
@@ -292,7 +289,8 @@ struct Peer {
          *  this does not have to be sorted. */
         std::set<uint256> m_tx_inventory_to_send GUARDED_BY(m_tx_inventory_mutex);
         /** Whether the peer has requested us to send our complete mempool. Only
-         *  permitted if the peer has NetPermissionFlags::Mempool. See BIP35. */
+         *  permitted if the peer has NetPermissionFlags::Mempool or we advertise
+         *  NODE_BLOOM. See BIP35. */
         bool m_send_mempool GUARDED_BY(m_tx_inventory_mutex){false};
         /** The last time a BIP35 `mempool` request was serviced. */
         std::atomic<std::chrono::seconds> m_last_mempool_req{0s};
@@ -882,8 +880,11 @@ private:
     /** Remove this block from our tracked requested blocks. Called if:
      *  - the block has been received from a peer
      *  - the request for the block has timed out
+     * If "from_peer" is specified, then only remove the block if it is in
+     * flight from that peer (to avoid one peer's network traffic from
+     * affecting another's state).
      */
-    void RemoveBlockRequest(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    void RemoveBlockRequest(const uint256& hash, std::optional<NodeId> from_peer) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /* Mark a block as in flight
      * Returns false, still setting pit, if the block was already in flight from the same peer
@@ -1119,7 +1120,7 @@ bool PeerManagerImpl::IsBlockRequested(const uint256& hash)
     return mapBlocksInFlight.find(hash) != mapBlocksInFlight.end();
 }
 
-void PeerManagerImpl::RemoveBlockRequest(const uint256& hash)
+void PeerManagerImpl::RemoveBlockRequest(const uint256& hash, std::optional<NodeId> from_peer)
 {
     auto it = mapBlocksInFlight.find(hash);
     if (it == mapBlocksInFlight.end()) {
@@ -1128,6 +1129,12 @@ void PeerManagerImpl::RemoveBlockRequest(const uint256& hash)
     }
 
     auto [node_id, list_it] = it->second;
+
+    if (from_peer && node_id != *from_peer) {
+        // Block was requested by another peer
+        return;
+    }
+
     CNodeState *state = State(node_id);
     assert(state != nullptr);
 
@@ -1163,7 +1170,7 @@ bool PeerManagerImpl::BlockRequested(NodeId nodeid, const CBlockIndex& block, st
     }
 
     // Make sure it's not listed somewhere already.
-    RemoveBlockRequest(hash);
+    RemoveBlockRequest(hash, std::nullopt);
 
     std::list<QueuedBlock>::iterator it = state->vBlocksInFlight.insert(state->vBlocksInFlight.end(),
             {&block, std::unique_ptr<PartiallyDownloadedBlock>(pit ? new PartiallyDownloadedBlock(&m_mempool) : nullptr)});
@@ -2179,7 +2186,7 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
         // Fast-path: in this case it is possible to serve the block directly from disk,
         // as the network format matches the format on disk
         std::vector<uint8_t> block_data;
-        if (!ReadRawBlockFromDisk(block_data, pindex->GetBlockPos(), m_chainparams.MessageStart())) {
+        if (!m_chainman.m_blockman.ReadRawBlockFromDisk(block_data, pindex->GetBlockPos(), m_chainparams.MessageStart())) {
             assert(!"cannot load block from disk");
         }
         m_connman.PushMessage(&pfrom, msgMaker.Make(NetMsgType::BLOCK, Span{block_data}));
@@ -2187,7 +2194,7 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
     } else {
         // Send block from disk
         std::shared_ptr<CBlock> pblockRead = std::make_shared<CBlock>();
-        if (!ReadBlockFromDisk(*pblockRead, pindex, m_chainparams.GetConsensus())) {
+        if (!m_chainman.m_blockman.ReadBlockFromDisk(*pblockRead, *pindex)) {
             assert(!"cannot load block from disk");
         }
         pblock = pblockRead;
@@ -3154,6 +3161,11 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
     m_chainman.ProcessNewBlock(block, force_processing, min_pow_checked, &new_block);
     if (new_block) {
         node.m_last_block_time = GetTime<std::chrono::seconds>();
+        // In case this block came from a different peer than we requested
+        // from, we can erase the block request now anyway (as we just stored
+        // this block to disk).
+        LOCK(cs_main);
+        RemoveBlockRequest(block->GetHash(), std::nullopt);
     } else {
         LOCK(cs_main);
         mapBlockSource.erase(block->GetHash());
@@ -3296,11 +3308,13 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         if (greatest_common_version >= WTXID_RELAY_VERSION && m_txreconciliation) {
             // Per BIP-330, we announce txreconciliation support if:
             // - protocol version per the peer's VERSION message supports WTXID_RELAY;
-            // - transaction relay is supported per the peer's VERSION message (see m_relays_txs);
-            // - this is not a block-relay-only connection and not a feeler (see m_relays_txs);
+            // - transaction relay is supported per the peer's VERSION message
+            // - this is not a block-relay-only connection and not a feeler
             // - this is not an addr fetch connection;
             // - we are not in -blocksonly mode.
-            if (pfrom.m_relays_txs && !pfrom.IsAddrFetchConn() && !m_ignore_incoming_txs) {
+            const auto* tx_relay = peer->GetTxRelay();
+            if (tx_relay && WITH_LOCK(tx_relay->m_bloom_filter_mutex, return tx_relay->m_relay_txs) &&
+                !pfrom.IsAddrFetchConn() && !m_ignore_incoming_txs) {
                 const uint64_t recon_salt = m_txreconciliation->PreRegisterPeer(pfrom.GetId());
                 m_connman.PushMessage(&pfrom, msg_maker.Make(NetMsgType::SENDTXRCNCL,
                                                              TXRECONCILIATION_VERSION, recon_salt));
@@ -3360,10 +3374,11 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         if (fLogIPs)
             remoteAddr = ", peeraddr=" + pfrom.addr.ToStringAddrPort();
 
-        LogPrint(BCLog::NET, "receive version message: %s: version %d, blocks=%d, us=%s, txrelay=%d, peer=%d%s\n",
+        const auto mapped_as{m_connman.GetMappedAS(pfrom.addr)};
+        LogPrint(BCLog::NET, "receive version message: %s: version %d, blocks=%d, us=%s, txrelay=%d, peer=%d%s%s\n",
                   cleanSubVer, pfrom.nVersion,
                   peer->m_starting_height, addrMe.ToStringAddrPort(), fRelay, pfrom.GetId(),
-                  remoteAddr);
+                  remoteAddr, (mapped_as ? strprintf(", mapped_as=%d", mapped_as) : ""));
 
         int64_t nTimeOffset = nTime - GetTime();
         pfrom.nTimeOffset = nTimeOffset;
@@ -3403,9 +3418,11 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         }
 
         if (!pfrom.IsInboundConn()) {
-            LogPrintf("New outbound peer connected: version: %d, blocks=%d, peer=%d%s (%s)\n",
+            const auto mapped_as{m_connman.GetMappedAS(pfrom.addr)};
+            LogPrintf("New outbound peer connected: version: %d, blocks=%d, peer=%d%s%s (%s)\n",
                       pfrom.nVersion.load(), peer->m_starting_height,
                       pfrom.GetId(), (fLogIPs ? strprintf(", peeraddr=%s", pfrom.addr.ToStringAddrPort()) : ""),
+                      (mapped_as ? strprintf(", mapped_as=%d", mapped_as) : ""),
                       pfrom.ConnectionTypeAsString());
         }
 
@@ -3528,7 +3545,8 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         // Peer must not offer us reconciliations if they specified no tx relay support in VERSION.
         // This flag might also be false in other cases, but the RejectIncomingTxs check above
         // eliminates them, so that this flag fully represents what we are looking for.
-        if (!pfrom.m_relays_txs) {
+        const auto* tx_relay = peer->GetTxRelay();
+        if (!tx_relay || !WITH_LOCK(tx_relay->m_bloom_filter_mutex, return tx_relay->m_relay_txs)) {
             LogPrintLevel(BCLog::NET, BCLog::Level::Debug, "sendtxrcncl received from peer=%d which indicated no tx relay to us; disconnecting\n", pfrom.GetId());
             pfrom.fDisconnect = true;
             return;
@@ -3868,7 +3886,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
 
             if (pindex->nHeight >= m_chainman.ActiveChain().Height() - MAX_BLOCKTXN_DEPTH) {
                 CBlock block;
-                bool ret = ReadBlockFromDisk(block, pindex, m_chainparams.GetConsensus());
+                const bool ret{m_chainman.m_blockman.ReadBlockFromDisk(block, *pindex)};
                 assert(ret);
 
                 SendBlockTransactions(pfrom, *peer, block, req);
@@ -4298,7 +4316,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 PartiallyDownloadedBlock& partialBlock = *(*queuedBlockIt)->partialBlock;
                 ReadStatus status = partialBlock.InitData(cmpctblock, vExtraTxnForCompact);
                 if (status == READ_STATUS_INVALID) {
-                    RemoveBlockRequest(pindex->GetBlockHash()); // Reset in-flight state in case Misbehaving does not result in a disconnect
+                    RemoveBlockRequest(pindex->GetBlockHash(), pfrom.GetId()); // Reset in-flight state in case Misbehaving does not result in a disconnect
                     Misbehaving(*peer, 100, "invalid compact block");
                     return;
                 } else if (status == READ_STATUS_FAILED) {
@@ -4393,7 +4411,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 // process from some other peer.  We do this after calling
                 // ProcessNewBlock so that a malleated cmpctblock announcement
                 // can't be used to interfere with block relay.
-                RemoveBlockRequest(pblock->GetHash());
+                RemoveBlockRequest(pblock->GetHash(), std::nullopt);
             }
         }
         return;
@@ -4425,7 +4443,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             PartiallyDownloadedBlock& partialBlock = *it->second.second->partialBlock;
             ReadStatus status = partialBlock.FillBlock(*pblock, resp.txn);
             if (status == READ_STATUS_INVALID) {
-                RemoveBlockRequest(resp.blockhash); // Reset in-flight state in case Misbehaving does not result in a disconnect
+                RemoveBlockRequest(resp.blockhash, pfrom.GetId()); // Reset in-flight state in case Misbehaving does not result in a disconnect
                 Misbehaving(*peer, 100, "invalid compact block/non-matching block transactions");
                 return;
             } else if (status == READ_STATUS_FAILED) {
@@ -4451,7 +4469,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 // though the block was successfully read, and rely on the
                 // handling in ProcessNewBlock to ensure the block index is
                 // updated, etc.
-                RemoveBlockRequest(resp.blockhash); // it is now an empty pointer
+                RemoveBlockRequest(resp.blockhash, pfrom.GetId()); // it is now an empty pointer
                 fBlockRead = true;
                 // mapBlockSource is used for potentially punishing peers and
                 // updating which peers send us compact blocks, so the race
@@ -4540,7 +4558,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             // Always process the block if we requested it, since we may
             // need it even when it's not a candidate for a new best tip.
             forceProcessing = IsBlockRequested(hash);
-            RemoveBlockRequest(hash);
+            RemoveBlockRequest(hash, pfrom.GetId());
             // mapBlockSource is only used for punishing peers and setting
             // which peers send us compact blocks, so the race between here and
             // cs_main in ProcessNewBlock is fine.
@@ -4594,6 +4612,8 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
     }
 
     if (msg_type == NetMsgType::MEMPOOL) {
+        // Only process received mempool messages if we advertise NODE_BLOOM
+        // or if the peer has mempool permissions.
         if (!(peer->m_our_services & NODE_BLOOM) && !pfrom.HasPermission(NetPermissionFlags::Mempool))
         {
             if (!pfrom.HasPermission(NetPermissionFlags::NoBan))
@@ -5523,7 +5543,7 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                         m_connman.PushMessage(pto, std::move(cached_cmpctblock_msg.value()));
                     } else {
                         CBlock block;
-                        bool ret = ReadBlockFromDisk(block, pBestIndex, consensusParams);
+                        const bool ret{m_chainman.m_blockman.ReadBlockFromDisk(block, *pBestIndex)};
                         assert(ret);
                         CBlockHeaderAndShortTxIDs cmpctblock{block};
                         m_connman.PushMessage(pto, msgMaker.Make(NetMsgType::CMPCTBLOCK, cmpctblock));
@@ -5657,7 +5677,9 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                     // especially since we have many peers and some will draw much shorter delays.
                     unsigned int nRelayedTransactions = 0;
                     LOCK(tx_relay->m_bloom_filter_mutex);
-                    while (!vInvTx.empty() && nRelayedTransactions < INVENTORY_BROADCAST_MAX) {
+                    size_t broadcast_max{INVENTORY_BROADCAST_MAX + (tx_relay->m_tx_inventory_to_send.size()/1000)*5};
+                    broadcast_max = std::min<size_t>(1000, broadcast_max);
+                    while (!vInvTx.empty() && nRelayedTransactions < broadcast_max) {
                         // Fetch the top element from the heap
                         std::pop_heap(vInvTx.begin(), vInvTx.end(), compareInvMempoolOrder);
                         std::set<uint256>::iterator it = vInvTx.back();
