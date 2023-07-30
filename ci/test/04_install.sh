@@ -22,15 +22,14 @@ if [[ $BITCOIN_CONFIG = *--with-sanitizers=*address* ]]; then # If ran with (ASa
   CI_CONTAINER_CAP="--cap-add SYS_PTRACE"
 fi
 
-export P_CI_DIR="$PWD"
-export BINS_SCRATCH_DIR="${BASE_SCRATCH_DIR}/bins/"
-
 if [ -z "$DANGER_RUN_CI_ON_HOST" ]; then
   # Export all env vars to avoid missing some.
   # Though, exclude those with newlines to avoid parsing problems.
-  python3 -c 'import os; [print(f"{key}={value}") for key, value in os.environ.items() if "\n" not in value]' | tee /tmp/env
+  python3 -c 'import os; [print(f"{key}={value}") for key, value in os.environ.items() if "\n" not in value and "HOME" != key and "PATH" != key and "USER" != key]' | tee /tmp/env
+  # System-dependent env vars must be kept as is. So read them from the container.
+  docker run --rm "${CI_IMAGE_NAME_TAG}" bash -c "env | grep --extended-regexp '^(HOME|PATH|USER)='" | tee --append /tmp/env
   echo "Creating $CI_IMAGE_NAME_TAG container to run in"
-  DOCKER_BUILDKIT=1 ${CI_RETRY_EXE} docker build \
+  DOCKER_BUILDKIT=1 docker build \
       --file "${BASE_ROOT_DIR}/ci/test_imagefile" \
       --build-arg "CI_IMAGE_NAME_TAG=${CI_IMAGE_NAME_TAG}" \
       --build-arg "FILE_ENV=${FILE_ENV}" \
@@ -42,7 +41,9 @@ if [ -z "$DANGER_RUN_CI_ON_HOST" ]; then
 
   if [ -n "${RESTART_CI_DOCKER_BEFORE_RUN}" ] ; then
     echo "Restart docker before run to stop and clear all containers started with --rm"
-    systemctl restart docker
+    podman container stop --all  # Similar to "systemctl restart docker"
+    echo "Prune all dangling images"
+    docker image prune --force
   fi
 
   # shellcheck disable=SC2086
@@ -51,7 +52,6 @@ if [ -z "$DANGER_RUN_CI_ON_HOST" ]; then
                   --mount "type=volume,src=${CONTAINER_NAME}_ccache,dst=$CCACHE_DIR" \
                   --mount "type=volume,src=${CONTAINER_NAME}_depends,dst=$DEPENDS_DIR" \
                   --mount "type=volume,src=${CONTAINER_NAME}_previous_releases,dst=$PREVIOUS_RELEASES_DIR" \
-                  -w $BASE_ROOT_DIR \
                   --env-file /tmp/env \
                   --name $CONTAINER_NAME \
                   $CONTAINER_NAME)
@@ -62,7 +62,7 @@ else
 fi
 
 CI_EXEC () {
-  $CI_EXEC_CMD_PREFIX bash -c "export PATH=${BINS_SCRATCH_DIR}:\$PATH && cd \"$P_CI_DIR\" && $*"
+  $CI_EXEC_CMD_PREFIX bash -c "export PATH=${BINS_SCRATCH_DIR}:${BASE_ROOT_DIR}/ci/retry:\$PATH && cd \"${BASE_ROOT_DIR}\" && $*"
 }
 export -f CI_EXEC
 
@@ -74,39 +74,3 @@ CI_EXEC rsync --archive --stats --human-readable /ro_base/ "${BASE_ROOT_DIR}" ||
 CI_EXEC git config --global --add safe.directory \"*\"
 
 CI_EXEC mkdir -p "${BINS_SCRATCH_DIR}"
-
-if [ "$CI_OS_NAME" == "macos" ]; then
-  top -l 1 -s 0 | awk ' /PhysMem/ {print}'
-  echo "Number of CPUs: $(sysctl -n hw.logicalcpu)"
-else
-  CI_EXEC free -m -h
-  CI_EXEC echo "Number of CPUs \(nproc\):" \$\(nproc\)
-  CI_EXEC echo "$(lscpu | grep Endian)"
-fi
-CI_EXEC echo "Free disk space:"
-CI_EXEC df -h
-
-if [ "$RUN_FUZZ_TESTS" = "true" ]; then
-  export DIR_FUZZ_IN=${DIR_QA_ASSETS}/fuzz_seed_corpus/
-  if [ ! -d "$DIR_FUZZ_IN" ]; then
-    CI_EXEC git clone --depth=1 https://github.com/bitcoin-core/qa-assets "${DIR_QA_ASSETS}"
-  fi
-elif [ "$RUN_UNIT_TESTS" = "true" ] || [ "$RUN_UNIT_TESTS_SEQUENTIAL" = "true" ]; then
-  export DIR_UNIT_TEST_DATA=${DIR_QA_ASSETS}/unit_test_data/
-  if [ ! -d "$DIR_UNIT_TEST_DATA" ]; then
-    CI_EXEC mkdir -p "$DIR_UNIT_TEST_DATA"
-    CI_EXEC curl --location --fail https://github.com/bitcoin-core/qa-assets/raw/main/unit_test_data/script_assets_test.json -o "${DIR_UNIT_TEST_DATA}/script_assets_test.json"
-  fi
-fi
-
-CI_EXEC mkdir -p "${BASE_SCRATCH_DIR}/sanitizer-output/"
-
-if [ "$USE_BUSY_BOX" = "true" ]; then
-  echo "Setup to use BusyBox utils"
-  # tar excluded for now because it requires passing in the exact archive type in ./depends (fixed in later BusyBox version)
-  # ar excluded for now because it does not recognize the -q option in ./depends (unknown if fixed)
-  # shellcheck disable=SC1010
-  CI_EXEC for util in \$\(busybox --list \| grep -v "^ar$" \| grep -v "^tar$" \)\; do ln -s \$\(command -v busybox\) "${BINS_SCRATCH_DIR}/\$util"\; done
-  # Print BusyBox version
-  CI_EXEC patch --help
-fi

@@ -164,8 +164,8 @@ bool AddLocal(const CNetAddr& addr, int nScore = LOCAL_NONE);
 void RemoveLocal(const CService& addr);
 bool SeenLocal(const CService& addr);
 bool IsLocal(const CService& addr);
-bool GetLocal(CService &addr, const CNetAddr *paddrPeer = nullptr);
-CService GetLocalAddress(const CNetAddr& addrPeer);
+bool GetLocal(CService& addr, const CNode& peer);
+CService GetLocalAddress(const CNode& peer);
 CService MaybeFlipIPv6toCJDNS(const CService& service);
 
 
@@ -200,7 +200,9 @@ public:
     int nVersion;
     std::string cleanSubVer;
     bool fInbound;
+    // We requested high bandwidth connection to peer
     bool m_bip152_highbandwidth_to;
+    // Peer requested high bandwidth connection
     bool m_bip152_highbandwidth_from;
     int m_starting_height;
     uint64_t nSendBytes;
@@ -1217,7 +1219,6 @@ private:
         std::vector<CNode*> m_nodes_copy;
     };
 
-    friend struct CConnmanTest;
     friend struct ConnmanTestMsg;
 };
 

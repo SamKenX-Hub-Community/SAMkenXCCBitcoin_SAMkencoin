@@ -14,6 +14,8 @@ class CChainParams;
 class CTxMemPool;
 class ChainstateManager;
 
+/** Whether transaction reconciliation protocol should be enabled by default. */
+static constexpr bool DEFAULT_TXRECONCILIATION_ENABLE{false};
 /** Default for -maxorphantx, maximum number of orphan transactions kept in memory */
 static const unsigned int DEFAULT_MAX_ORPHAN_TRANSACTIONS = 100;
 /** Default number of orphan+recently-replaced txn to keep around for block reconstruction */
@@ -22,6 +24,8 @@ static const bool DEFAULT_PEERBLOOMFILTERS = false;
 static const bool DEFAULT_PEERBLOCKFILTERS = false;
 /** Threshold for marking a node to be discouraged, e.g. disconnected and added to the discouragement filter. */
 static const int DISCOURAGEMENT_THRESHOLD{100};
+/** Maximum number of outstanding CMPCTBLOCK requests for the same block. */
+static const unsigned int MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK = 3;
 
 struct CNodeStateStats {
     int nSyncHeight = -1;
@@ -41,9 +45,18 @@ struct CNodeStateStats {
 class PeerManager : public CValidationInterface, public NetEventsInterface
 {
 public:
+    struct Options {
+        /** Whether this node is running in -blocksonly mode */
+        bool ignore_incoming_txs{DEFAULT_BLOCKSONLY};
+        bool reconcile_txs{DEFAULT_TXRECONCILIATION_ENABLE};
+        uint32_t max_orphan_txs{DEFAULT_MAX_ORPHAN_TRANSACTIONS};
+        size_t max_extra_txs{DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN};
+        bool capture_messages{false};
+    };
+
     static std::unique_ptr<PeerManager> make(CConnman& connman, AddrMan& addrman,
                                              BanMan* banman, ChainstateManager& chainman,
-                                             CTxMemPool& pool, bool ignore_incoming_txs);
+                                             CTxMemPool& pool, Options opts);
     virtual ~PeerManager() { }
 
     /**

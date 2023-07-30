@@ -33,6 +33,9 @@ struct FlatFilePos;
 namespace Consensus {
 struct Params;
 }
+namespace util {
+class SignalInterrupt;
+} // namespace util
 
 namespace node {
 
@@ -152,10 +155,12 @@ private:
 public:
     using Options = kernel::BlockManagerOpts;
 
-    explicit BlockManager(Options opts)
+    explicit BlockManager(const util::SignalInterrupt& interrupt, Options opts)
         : m_prune_mode{opts.prune_target > 0},
-          m_opts{std::move(opts)} {};
+          m_opts{std::move(opts)},
+          m_interrupt{interrupt} {};
 
+    const util::SignalInterrupt& m_interrupt;
     std::atomic<bool> m_importing{false};
 
     BlockMap m_block_index GUARDED_BY(cs_main);
@@ -208,16 +213,21 @@ public:
 
     [[nodiscard]] bool LoadingBlocks() const { return m_importing || fReindex; }
 
-    [[nodiscard]] bool StopAfterBlockImport() const { return m_opts.stop_after_block_import; }
-
     /** Calculate the amount of disk space the block & undo files currently use */
     uint64_t CalculateCurrentUsage();
 
     //! Returns last CBlockIndex* that is a checkpoint
     const CBlockIndex* GetLastCheckpoint(const CCheckpointData& data) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
-    //! Find the first block that is not pruned
-    const CBlockIndex* GetFirstStoredBlock(const CBlockIndex& start_block LIFETIMEBOUND) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! Check if all blocks in the [upper_block, lower_block] range have data available.
+    //! The caller is responsible for ensuring that lower_block is an ancestor of upper_block
+    //! (part of the same chain).
+    bool CheckBlockDataAvailability(const CBlockIndex& upper_block LIFETIMEBOUND, const CBlockIndex& lower_block LIFETIMEBOUND) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    //! Find the first stored ancestor of start_block immediately after the last
+    //! pruned ancestor. Return value will never be null. Caller is responsible
+    //! for ensuring that start_block has data is not pruned.
+    const CBlockIndex* GetFirstStoredBlock(const CBlockIndex& start_block LIFETIMEBOUND, const CBlockIndex* lower_block=nullptr) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /** True if any block files have ever been pruned. */
     bool m_have_pruned = false;
@@ -249,7 +259,7 @@ public:
     void CleanupBlockRevFiles() const;
 };
 
-void ThreadImport(ChainstateManager& chainman, std::vector<fs::path> vImportFiles, const fs::path& mempool_path);
+void ImportBlocks(ChainstateManager& chainman, std::vector<fs::path> vImportFiles);
 } // namespace node
 
 #endif // BITCOIN_NODE_BLOCKSTORAGE_H

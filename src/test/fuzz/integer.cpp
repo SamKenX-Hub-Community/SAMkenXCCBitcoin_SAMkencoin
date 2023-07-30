@@ -4,6 +4,7 @@
 
 #include <arith_uint256.h>
 #include <common/args.h>
+#include <common/system.h>
 #include <compressor.h>
 #include <consensus/amount.h>
 #include <consensus/merkle.h>
@@ -32,7 +33,6 @@
 #include <util/overflow.h>
 #include <util/strencodings.h>
 #include <util/string.h>
-#include <util/system.h>
 #include <version.h>
 
 #include <cassert>
@@ -46,7 +46,7 @@ void initialize_integer()
     SelectParams(ChainType::REGTEST);
 }
 
-FUZZ_TARGET_INIT(integer, initialize_integer)
+FUZZ_TARGET(integer, .init = initialize_integer)
 {
     if (buffer.size() < sizeof(uint256) + sizeof(uint160)) {
         return;
