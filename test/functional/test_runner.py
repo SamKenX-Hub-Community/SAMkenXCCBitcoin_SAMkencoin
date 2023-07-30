@@ -74,12 +74,12 @@ TEST_EXIT_SKIPPED = 77
 TEST_FRAMEWORK_MODULES = [
     "address",
     "blocktools",
-    "muhash",
+    "ellswift",
     "key",
+    "muhash",
     "ripemd160",
     "script",
     "segwit_addr",
-    "util",
 ]
 
 EXTENDED_SCRIPTS = [
@@ -166,11 +166,14 @@ BASE_SCRIPTS = [
     'p2p_compactblocks_blocksonly.py',
     'wallet_hd.py --legacy-wallet',
     'wallet_hd.py --descriptors',
+    'wallet_blank.py --legacy-wallet',
+    'wallet_blank.py --descriptors',
     'wallet_keypool_topup.py --legacy-wallet',
     'wallet_keypool_topup.py --descriptors',
     'wallet_fast_rescan.py --descriptors',
     'interface_zmq.py',
     'rpc_invalid_address_message.py',
+    'rpc_validateaddress.py',
     'interface_bitcoin_cli.py --legacy-wallet',
     'interface_bitcoin_cli.py --descriptors',
     'feature_bind_extra.py',
@@ -195,6 +198,8 @@ BASE_SCRIPTS = [
     'wallet_watchonly.py --legacy-wallet',
     'wallet_watchonly.py --usecli --legacy-wallet',
     'wallet_reorgsrestore.py',
+    'wallet_conflicts.py --legacy-wallet',
+    'wallet_conflicts.py --descriptors',
     'interface_http.py',
     'interface_rpc.py',
     'interface_usdt_coinselection.py',
@@ -205,7 +210,6 @@ BASE_SCRIPTS = [
     'rpc_users.py',
     'rpc_whitelist.py',
     'feature_proxy.py',
-    'feature_syscall_sandbox.py',
     'wallet_signrawtransactionwithwallet.py --legacy-wallet',
     'wallet_signrawtransactionwithwallet.py --descriptors',
     'rpc_signrawtransactionwithkey.py',
@@ -528,6 +532,12 @@ def run_tests(*, test_list, src_dir, build_dir, tmpdir, jobs=1, enable_coverage=
 
     # Test Framework Tests
     print("Running Unit Tests for Test Framework Modules")
+
+    tests_dir = src_dir + '/test/functional/'
+    # This allows `test_runner.py` to work from an out-of-source build directory using a symlink,
+    # a hard link or a copy on any platform. See https://github.com/bitcoin/bitcoin/pull/27561.
+    sys.path.append(tests_dir)
+
     test_framework_tests = unittest.TestSuite()
     for module in TEST_FRAMEWORK_MODULES:
         test_framework_tests.addTest(unittest.TestLoader().loadTestsFromName("test_framework.{}".format(module)))
@@ -535,8 +545,6 @@ def run_tests(*, test_list, src_dir, build_dir, tmpdir, jobs=1, enable_coverage=
     if not result.wasSuccessful():
         logging.debug("Early exiting after failure in TestFramework unit tests")
         sys.exit(False)
-
-    tests_dir = src_dir + '/test/functional/'
 
     flags = ['--cachedir={}'.format(cache_dir)] + args
 

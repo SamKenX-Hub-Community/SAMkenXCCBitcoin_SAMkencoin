@@ -12,13 +12,15 @@ import inspect
 import json
 import logging
 import os
+import pathlib
 import random
 import re
+import sys
 import time
 
 from . import coverage
 from .authproxy import AuthServiceProxy, JSONRPCException
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 logger = logging.getLogger("TestFramework.utils")
 
@@ -209,12 +211,6 @@ def check_json_precision():
         raise RuntimeError("JSON encode/decode loses precision")
 
 
-def EncodeDecimal(o):
-    if isinstance(o, Decimal):
-        return str(o)
-    raise TypeError(repr(o) + " is not JSON serializable")
-
-
 def count_bytes(hex_string):
     return len(bytearray.fromhex(hex_string))
 
@@ -313,7 +309,7 @@ class PortSeed:
     n = None
 
 
-def get_rpc_proxy(url: str, node_number: int, *, timeout: int=None, coveragedir: str=None) -> coverage.AuthServiceProxyWrapper:
+def get_rpc_proxy(url: str, node_number: int, *, timeout: Optional[int]=None, coveragedir: Optional[str]=None) -> coverage.AuthServiceProxyWrapper:
     """
     Args:
         url: URL of the RPC server to call
@@ -417,6 +413,22 @@ def write_config(config_path, *, n, chain, extra_config="", disable_autoconnect=
 
 def get_datadir_path(dirname, n):
     return os.path.join(dirname, "node" + str(n))
+
+
+def get_temp_default_datadir(temp_dir: pathlib.Path) -> Tuple[dict, pathlib.Path]:
+    """Return os-specific environment variables that can be set to make the
+    GetDefaultDataDir() function return a datadir path under the provided
+    temp_dir, as well as the complete path it would return."""
+    if sys.platform == "win32":
+        env = dict(APPDATA=str(temp_dir))
+        datadir = temp_dir / "Bitcoin"
+    else:
+        env = dict(HOME=str(temp_dir))
+        if sys.platform == "darwin":
+            datadir = temp_dir / "Library/Application Support/Bitcoin"
+        else:
+            datadir = temp_dir / ".bitcoin"
+    return env, datadir
 
 
 def append_config(datadir, options):
